@@ -28,9 +28,22 @@ export async function sessionTicket(request: Request, env: Env, accountId: strin
     body: JSON.stringify(grant.mode === 'saved' ? { hostId: grant.hostId } : {}),
   }));
   if (!response.ok) return jsonError('Unable to create a session ticket', 503);
-  const ticket = await response.json<{ ticket: string; expiresAt: number }>();
+  const payload = await response.json<unknown>();
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return jsonError('Unable to create a session ticket', 503);
+  }
+  const internal = payload as Record<string, unknown>;
+  if (typeof internal.ticket !== 'string' || internal.ticket.length < 1 || internal.ticket.length > 2048
+    || typeof internal.expiresAt !== 'number' || !Number.isFinite(internal.expiresAt)) {
+    return jsonError('Unable to create a session ticket', 503);
+  }
   return secureResponse(Response.json(
-    { ...ticket, sessionId: id.toString(), mode: grant.mode },
+    {
+      ticket: internal.ticket,
+      expiresAt: internal.expiresAt,
+      sessionId: id.toString(),
+      mode: grant.mode,
+    },
     { headers: { 'Cache-Control': 'no-store' } },
   ));
 }

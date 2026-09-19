@@ -1964,6 +1964,7 @@ ui.keyFile.addEventListener('change', async () => {
     clearPrivateKeyFields();
     return;
   }
+  cancelSavedSelection();
   ui.keyFileName.textContent = file.name;
   if (file.size > MAX_KEY_BYTES) {
     showFormError(bilingual('所选私钥大于 64 KiB。', 'The selected private key is larger than 64 KiB.'));

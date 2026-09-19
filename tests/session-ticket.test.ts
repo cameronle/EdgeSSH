@@ -48,7 +48,12 @@ function fakeEnv(hosts: SavedHost[]) {
         return {
           async fetch(request: Request) {
             internalRequests.push(request);
-            return Response.json({ ticket: 'one-time-ticket', expiresAt: 1_900_000_000_000 });
+            return Response.json({
+              ticket: 'one-time-ticket',
+              expiresAt: 1_900_000_000_000,
+              privateKey: 'must-not-cross-the-internal-boundary',
+              encrypted_payload: 'must-not-cross-the-internal-boundary',
+            });
           },
         };
       },
