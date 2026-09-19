@@ -125,17 +125,17 @@ Cloudflare 账户 ID 可在 Dashboard 的账户概览或 Worker 概览中复制�
 
 ## 2026-09-19 线上部署记录
 
-- 正式入口：`https://ssh.dltwcnm.ccwu.cc`
-- D1：`edgessh-accounts`（`2c1b7a95-a5d6-4a72-a8d2-4132b74aa268`）
+- 正式入口：`https://ssh.865455.xyz`
+- D1：`edgessh-accounts`（`f7059f46-a0df-4924-bb8d-de6cf213f6c4`）
 - D1 schema：`hosts`、`d1_migrations`；记录数分别为 0、1
-- 活动版本：由 GitHub Actions 的 `Deploy` workflow 自动发布，当前状态以 Actions 运行记录与 Cloudflare 控制台为准
+- 活动版本：由 Cloudflare Workers Builds 监听 `production` 分支自动发布，当前状态以 Workers Builds 记录与 Cloudflare 控制台为准
 - Secret 名称：`ENCRYPTION_KEY`、`ACCESS_TEAM_DOMAIN`、`ACCESS_AUD`；本次部署未读取或覆盖任何运行时 Secret
 - 无会话 Smoke：正式入口 `/` 与 `/api/auth/me` 均返回 Access 302，TLS 正常；未记录重定向地址、Team Domain、AUD、JWT、Cookie 或 Secret 值
-- 诊断入口：`workers.dev` 已开启，仅额外公开固定 `8.8.8.8` 的定位链路检查；账号、主机、凭据与 SSH 等接口仍必须通过 Access JWT 校验
+- `workers.dev` 未作为生产入口启用；账号、主机、凭据与 SSH 等接口均通过 `ssh.865455.xyz` 的 Cloudflare Access 保护
 - 待验收：需要用户登录 Access 后验收账号 API，并使用真实授权 SSH 目标验收终端、SFTP 与进程面板
 
 ## 自定义域名
 
-- 正式入口：`https://ssh.dltwcnm.ccwu.cc`
-- `workers.dev` 作为诊断入口保留；Worker 仍在应用层强制校验所有生产账号与连接 API，不允许绕过自定义域名上的 Access 策略。
-- Access 应用、策略与三个运行时 Secret 均由用户在 Cloudflare 控制台维护；GitHub Actions 只负责迁移与部署代码。
+- 正式入口：`https://ssh.865455.xyz`
+- `workers.dev` 未作为生产入口；Worker 仍在应用层强制校验所有生产账号与连接 API，不允许绕过自定义域名上的 Access 策略。
+- Access 应用、策略与三个运行时 Secret 均由用户在 Cloudflare 控制台维护；Cloudflare Workers Builds 负责从 `production` 分支构建与部署代码。
