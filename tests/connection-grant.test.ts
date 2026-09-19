@@ -124,3 +124,17 @@ test('saved grant fails closed when the host is not owned by the Access account'
     (error: unknown) => error instanceof Error && error.message === 'Saved host is unavailable',
   );
 });
+
+test('saved grant fails closed when the host is deleted after ticket issuance', async () => {
+  const key = base64(crypto.getRandomValues(new Uint8Array(32)));
+  const env = fakeEnv([], key);
+  await assert.rejects(
+    connectionConfigForGrant(
+      env,
+      ACCOUNT_ID,
+      { mode: 'saved', hostId: HOST_ID },
+      { type: 'connect_saved', cols: 120, rows: 40 },
+    ),
+    (error: unknown) => error instanceof Error && error.message === 'Saved host is unavailable',
+  );
+});

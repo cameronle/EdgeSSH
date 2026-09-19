@@ -156,14 +156,37 @@ test('savedConnectionConfig hides ciphertext and credential details when decrypt
   const row = await encryptedRow(key);
   row.encrypted_payload = 'v1.invalid.invalid';
   const env = fakeEnv([row], key);
+  const calls: unknown[][] = [];
+  const original = {
+    debug: console.debug,
+    error: console.error,
+    info: console.info,
+    log: console.log,
+    warn: console.warn,
+  };
+  const spy = (...args: unknown[]): void => { calls.push(args); };
+  console.debug = spy;
+  console.error = spy;
+  console.info = spy;
+  console.log = spy;
+  console.warn = spy;
 
-  await assert.rejects(
-    savedConnectionConfig(env, ACCOUNT_A, HOST_ID, 120, 40),
-    (error: unknown) => {
-      assert.equal(error instanceof Error ? error.message : '', 'Saved host is unavailable');
-      assert.equal(String(error).includes(row.encrypted_payload), false);
-      assert.equal(String(error).includes('stored-secret-password'), false);
-      return true;
-    },
-  );
+  try {
+    await assert.rejects(
+      savedConnectionConfig(env, ACCOUNT_A, HOST_ID, 120, 40),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : '', 'Saved host is unavailable');
+        assert.equal(String(error).includes(row.encrypted_payload), false);
+        assert.equal(String(error).includes('stored-secret-password'), false);
+        return true;
+      },
+    );
+    assert.deepEqual(calls, []);
+  } finally {
+    console.debug = original.debug;
+    console.error = original.error;
+    console.info = original.info;
+    console.log = original.log;
+    console.warn = original.warn;
+  }
 });

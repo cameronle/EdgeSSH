@@ -1,15 +1,19 @@
 import { connect } from 'cloudflare:sockets';
 import { parseSessionRequest, type Env, type SessionGrant, type SSHConnectionConfig } from '../types';
 import { assertPublicTarget, toSocketHostname } from './security';
-import { createTicket, verifyTicket } from './security';
+import { createTicket } from './security';
 import { SSHSession } from './session';
 import { connectionConfigForGrant } from './connection-grant';
+import {
+  consumeStoredTicket,
+  SESSION_TICKET_STORAGE_KEY,
+  type StoredTicket,
+} from './ticket-store';
 
 interface MainAttachment { role: 'main'; phase: 'waiting' | 'connecting' | 'connected' }
 interface SFTPAttachment { role: 'sftp'; phase: 'connected' }
 interface ProcessAttachment { role: 'process'; phase: 'connected' }
 type Attachment = MainAttachment | SFTPAttachment | ProcessAttachment;
-interface StoredTicket { secret: number[]; expiresAt: number; ip: string; grant: SessionGrant }
 interface PendingGrant { accountId: string; grant: SessionGrant }
 interface PendingConnection {
   cancelled: boolean;
@@ -24,7 +28,6 @@ interface SFTPAttachToken {
   session?: SSHSession;
 }
 type AuxiliaryAttachToken = SFTPAttachToken;
-const TICKET_STORAGE_KEY = 'session-ticket';
 const SFTP_ATTACH_TOKEN_TTL_MS = 10 * 60 * 1000;
 const SFTP_ATTACH_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -74,8 +77,8 @@ export class SSHSessionDO implements DurableObject {
       const secret = crypto.getRandomValues(new Uint8Array(32));
       const created = await createTicket(secret, ip);
       const stored = await this.state.storage.transaction(async (tx) => {
-        if (await tx.get(TICKET_STORAGE_KEY)) return false;
-        await tx.put(TICKET_STORAGE_KEY, { secret: Array.from(secret), expiresAt: created.expiresAt, ip, grant } satisfies StoredTicket);
+        if (await tx.get(SESSION_TICKET_STORAGE_KEY)) return false;
+        await tx.put(SESSION_TICKET_STORAGE_KEY, { secret: Array.from(secret), expiresAt: created.expiresAt, ip, grant } satisfies StoredTicket);
         await tx.put('account-id', accountId);
         await tx.setAlarm(created.expiresAt);
         return true;
@@ -230,7 +233,7 @@ export class SSHSessionDO implements DurableObject {
   }
 
   async alarm(): Promise<void> {
-    await this.state.storage.delete(TICKET_STORAGE_KEY);
+    await this.state.storage.delete(SESSION_TICKET_STORAGE_KEY);
     await this.state.storage.delete('account-id');
   }
 
@@ -240,26 +243,7 @@ export class SSHSessionDO implements DurableObject {
   }
 
   private async consumeTicket(ticket: string, ip: string): Promise<SessionGrant | null> {
-    return this.state.storage.transaction(async (tx) => {
-      const stored = await tx.get<StoredTicket>(TICKET_STORAGE_KEY);
-      if (!stored) return null;
-      // A presented ticket is one-shot even when malformed, which closes the
-      // replay race without retaining authorization material after an attempt.
-      await tx.delete(TICKET_STORAGE_KEY);
-      await tx.deleteAlarm();
-      // 清理最终闲置对象的授权元数据；活跃连接不依赖此定时器继续传输。
-      await tx.setAlarm(Date.now() + 7 * 86400_000);
-      // 不校验 stored.ip !== ip：反代/CDN（如腾讯云 EdgeOne）多节点回源会让
-      // CF-Connecting-IP 在签发与使用两次请求间不一致，导致 ticket 误判失效
-      // （概率性 "WebSocket 传输错误"）。详见 verifyTicket 注释。stored.ip 保留用于审计。
-      if (stored.expiresAt < Date.now() || stored.secret.length !== 32 || !stored.grant) return null;
-      const secret = new Uint8Array(stored.secret);
-      try {
-        return await verifyTicket(secret, ticket, ip) ? stored.grant : null;
-      } finally {
-        secret.fill(0);
-      }
-    });
+    return consumeStoredTicket(this.state.storage, ticket, ip);
   }
 
   private attachSFTP(request: Request): Response {
