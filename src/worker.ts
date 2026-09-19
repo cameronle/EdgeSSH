@@ -5,41 +5,13 @@ import { currentAccount } from './accounts/auth';
 import { hostsRoute } from './accounts/hosts';
 import { apiFailure, json } from './accounts/http';
 import { locateHost } from './accounts/location';
+import { clientAddress, sessionTicket } from './accounts/session-ticket';
 
 export { SSHSessionDO };
-
-function clientAddress(request: Request): string {
-  const value = request.headers.get('CF-Connecting-IP') ?? 'local';
-  return /^[0-9A-Fa-f:.]{2,64}$/.test(value) ? value.toLowerCase() : 'unknown';
-}
 
 function hasValidWebSocketOrigin(request: Request): boolean {
   const origin = request.headers.get('Origin');
   return origin === null || origin === new URL(request.url).origin;
-}
-
-async function sessionTicket(request: Request, env: Env, accountId: string): Promise<Response> {
-  if (!request.headers.get('Content-Type')?.toLowerCase().startsWith('application/json')) return jsonError('Expected application/json', 415);
-  const contentLength = Number(request.headers.get('Content-Length') ?? 0);
-  if (!Number.isFinite(contentLength) || contentLength < 0 || contentLength > 8192) return jsonError('Request body is too large', 413);
-  let body: unknown;
-  try {
-    const text = await request.text();
-    if (new TextEncoder().encode(text).length > 8192) return jsonError('Request body is too large', 413);
-    body = JSON.parse(text);
-  } catch { return jsonError('Invalid JSON body', 400); }
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonError('Invalid JSON body', 400);
-  const fields = Object.keys(body as Record<string, unknown>);
-  if (fields.length > 0) return jsonError('Unsupported request field', 400);
-  const id = env.SSH_SESSIONS.newUniqueId();
-  const stub = env.SSH_SESSIONS.get(id);
-  const response = await stub.fetch(new Request('https://session.internal/ticket', {
-    method: 'POST',
-    headers: { 'x-client-ip': clientAddress(request), 'x-account-id': accountId },
-  }));
-  if (!response.ok) return jsonError('Unable to create a session ticket', 503);
-  const ticket = await response.json<{ ticket: string; expiresAt: number }>();
-  return secureResponse(Response.json({ ...ticket, sessionId: id.toString() }, { headers: { 'Cache-Control': 'no-store' } }));
 }
 
 async function sshUpgrade(request: Request, env: Env, accountId: string): Promise<Response> {

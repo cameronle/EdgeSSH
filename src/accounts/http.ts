@@ -1,7 +1,12 @@
-import { jsonError, secureResponse } from '../http-security';
+import { jsonError, secureResponse } from '../http-security.ts';
 
 export class APIError extends Error {
-  constructor(message: string, readonly status = 400) { super(message); }
+  readonly status: number;
+
+  constructor(message: string, status = 400) {
+    super(message);
+    this.status = status;
+  }
 }
 
 export function json(value: unknown, status = 200, headers?: HeadersInit): Response {

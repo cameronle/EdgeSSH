@@ -289,7 +289,7 @@ export class Dashboard {
   private async connectHost(host: CloudHost): Promise<void> {
     if (this.busy) return;
     this.busy = true; this.root.setAttribute('aria-busy', 'true');
-    this.notice(`正在读取 ${host.name} 的连接凭据…`);
+    this.notice(`正在为 ${host.name} 创建受保护的 SSH 会话…`);
     try { await this.actions.connect(host); this.openWorkspace(); this.get('#home-notice').hidden = true; }
     catch (error) { this.notice(error instanceof Error ? error.message : '连接准备失败。'); }
     finally { this.busy = false; this.root.removeAttribute('aria-busy'); }

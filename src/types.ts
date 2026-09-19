@@ -41,6 +41,19 @@ export interface SSHConnectionConfig {
   expectedFingerprint?: string;
 }
 
+export type SessionMode = 'manual' | 'saved';
+
+export interface SessionGrant {
+  mode: SessionMode;
+  hostId?: string;
+}
+
+export interface SavedConnectMessage {
+  type: 'connect_saved';
+  cols: number;
+  rows: number;
+}
+
 export interface TerminalSize {
   cols: number;
   rows: number;
@@ -88,6 +101,7 @@ export const SSH_MSG_CHANNEL_FAILURE = 100;
 
 const HOST_RE = /^(?=.{1,253}$)(?:[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?\.)*[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/i;
 const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function normalizeTerminalSize(cols: unknown, rows: unknown): TerminalSize | null {
   if (typeof cols !== 'number' || typeof rows !== 'number' || !Number.isFinite(cols) || !Number.isFinite(rows)) {
@@ -111,6 +125,28 @@ function isValidHost(host: string): boolean {
     return bare.split('.').every((part) => Number(part) <= 255 && (part === '0' || !part.startsWith('0')));
   }
   return HOST_RE.test(bare);
+}
+
+export function parseSessionRequest(value: unknown): SessionGrant {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid session request');
+  const raw = value as Record<string, unknown>;
+  const fields = Object.keys(raw);
+  if (fields.length === 0) return { mode: 'manual' };
+  if (fields.length === 1 && fields[0] === 'hostId' && typeof raw.hostId === 'string' && UUID_V4_RE.test(raw.hostId)) {
+    return { mode: 'saved', hostId: raw.hostId };
+  }
+  throw new Error('Invalid session request');
+}
+
+export function parseSavedConnectMessage(value: unknown): SavedConnectMessage {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid saved connect message');
+  const raw = value as Record<string, unknown>;
+  if (raw.type !== 'connect_saved') throw new Error('Invalid saved connect message');
+  const allowedFields = new Set(['type', 'cols', 'rows']);
+  if (Object.keys(raw).some((field) => !allowedFields.has(field))) throw new Error('Unsupported saved connection field');
+  const size = normalizeTerminalSize(raw.cols, raw.rows);
+  if (!size) throw new Error('Invalid terminal size');
+  return { type: 'connect_saved', cols: size.cols, rows: size.rows };
 }
 
 export function parseConnectMessage(value: unknown): SSHConnectionConfig {

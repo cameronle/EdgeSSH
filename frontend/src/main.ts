@@ -10,7 +10,14 @@ import {
   type ThemePreference,
 } from './theme';
 import { historyKey, historyLabel } from './history';
-import { listHosts, hostCredentials, saveHost, removeHost, updateHostSystem, type CloudHost, type Credentials, type HostSystemInfo } from './cloud-api';
+import { listHosts, markHostConnected, saveHost, removeHost, updateHostSystem, type CloudHost, type HostSystemInfo } from './cloud-api';
+import {
+  buildInitialConnectFrame,
+  sessionRequestBody,
+  validateCredentialSelection,
+  type AuthMethod,
+  type ReconnectParams,
+} from './connection-mode';
 import { Dashboard } from './dashboard';
 import { resolveConnectionControl, resolveConnectionPanel } from './ui-state';
 import { classifyHostKey, SSH_FINGERPRINT_RE, type HostKeyPrompt } from './host-key';
@@ -22,7 +29,6 @@ import { WebSocketReconnectManager } from './ws-reconnect';
 import type { ReconnectLogEntry } from './ws-reconnect';
 import './style.css';
 
-type AuthMethod = 'password' | 'publickey';
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting' | 'error';
 type Language = 'zh-CN' | 'en';
 type Translation = readonly [zh: string, en: string];
@@ -32,7 +38,7 @@ interface LocalizedMessage {
   en: string;
 }
 
-type SavedProfile = CloudHost & Credentials;
+type SavedProfile = CloudHost & { password?: string; privateKey?: string };
 
 interface PendingHistory {
   generation: number;
@@ -49,19 +55,6 @@ interface HistoryMutationResult {
   applied: boolean;
 }
 
-interface ConnectionConfig {
-  type: 'connect';
-  host: string;
-  port: number;
-  username: string;
-  password?: string;
-  authMethod: AuthMethod;
-  privateKey?: string;
-  cols: number;
-  rows: number;
-  term: string;
-  expectedFingerprint?: string;
-}
 
 interface ServerMessage {
   type?: string;
@@ -261,6 +254,7 @@ const ui = {
   username: element<HTMLInputElement>('username'),
   password: element<HTMLInputElement>('password'),
   passwordField: element<HTMLElement>('password-field'),
+  savedCredentialNote: element<HTMLElement>('saved-credential-note'),
   revealPassword: element<HTMLButtonElement>('reveal-password'),
   keyField: element<HTMLElement>('key-field'),
   privateKey: element<HTMLTextAreaElement>('private-key'),
@@ -399,10 +393,9 @@ let currentSessionSubtitle: LocalizedMessage = { zh: '选择目标并连接', en
 let currentSessionId = '';
 let currentEventMessage: LocalizedMessage = { zh: 'Worker 运行时待命', en: 'Worker runtime standing by' };
 let currentFormError: LocalizedMessage | null = null;
-let passwordDirty = false;
+let credentialInputDirty = false;
+let selectedSavedHostId: string | null = null;
 let pendingHistory: PendingHistory | null = null;
-let historyPasswordLoading = false;
-let historyPasswordLoadGeneration = 0;
 let historyMutationSequence = 0;
 let keyFileReadGeneration = 0;
 let profileSaveTask: Promise<void> = Promise.resolve();
@@ -412,11 +405,7 @@ let fileManager: FileManager;
 let fileTree: FileTree;
 let processManager: ProcessManager;
 let sshReconnectManager: WebSocketReconnectManager | null = null;
-let reconnectParams: {
-  host: string; port: number; username: string; authMethod: string;
-  password?: string; privateKey?: string; pinnedKey?: string;
-  term: string; encoding: string;
-} | null = null;
+let reconnectParams: ReconnectParams | null = null;
 
 // Network rate state. The backend sends cumulative byte counters per interface
 // per tick; we keep a per-interface baseline (counters + local clock timestamp)
@@ -760,17 +749,9 @@ function setAuthMethod(method: AuthMethod): void {
   ui.keyField.hidden = method !== 'publickey';
 }
 
-function cancelHistoryPasswordLoad(): void {
-  if (!historyPasswordLoading) return;
-  historyPasswordLoadGeneration++;
-  historyPasswordLoading = false;
-  setState(connectionState);
-}
-
 function resetPasswordField(): void {
   ui.password.value = '';
   ui.password.type = 'password';
-  passwordDirty = false;
   updateRevealPasswordButton();
 }
 
@@ -784,14 +765,13 @@ function clearPrivateKeyFields(): void {
 function clearCredentials(): void {
   resetPasswordField();
   clearPrivateKeyFields();
+  credentialInputDirty = false;
+  ui.savedCredentialNote.hidden = true;
 }
 
-// A stale async history-password decrypt must never overwrite the form. The
-// connection lifecycle keeps the entered credentials in place (history can
-// restore them anyway), so only the in-flight load is invalidated here.
-function invalidateHistoryPasswordLoad(): void {
-  historyPasswordLoadGeneration++;
-  historyPasswordLoading = false;
+function releaseReconnectParams(): void {
+  if (reconnectParams?.mode === 'manual') clearCredentials();
+  reconnectParams = null;
 }
 
 function normalizeHost(host: string): string {
@@ -811,6 +791,30 @@ function targetLabel(host: string, port: number, username: string): string {
 function applyFormDefaults(): void {
   if (!ui.username.value.trim()) ui.username.value = 'root';
   if (!ui.port.value.trim() && !ui.port.validity.badInput) ui.port.value = '22';
+}
+
+function selectedSavedProfile(): SavedProfile | null {
+  if (!selectedSavedHostId || credentialInputDirty) return null;
+  const profile = profiles.find((item) => item.id === selectedSavedHostId);
+  if (!profile || !profile.hasCredential) return null;
+  const fingerprint = profile.fingerprint || hostKeys[passwordContext(profile)] || '';
+  return normalizeHost(ui.host.value) === profile.host
+    && Number(ui.port.value) === profile.port
+    && ui.username.value.trim() === profile.username
+    && authMethod() === profile.authMethod
+    && ui.termType.value === profile.termType
+    && ui.fingerprint.value.trim() === fingerprint
+    ? profile
+    : null;
+}
+
+function cancelSavedSelection(): void {
+  if (!selectedSavedHostId && credentialInputDirty) return;
+  selectedSavedHostId = null;
+  ui.profileId.value = '';
+  credentialInputDirty = true;
+  ui.savedCredentialNote.hidden = true;
+  renderProfiles();
 }
 
 function readProfileFromForm(password: string): Promise<SavedProfile> {
@@ -858,12 +862,15 @@ function validateProfileFields(): string | null {
 function validateConnection(): string | null {
   const profileError = validateProfileFields();
   if (profileError) return profileError;
-  if (authMethod() === 'publickey') {
-    const key = ui.privateKey.value.trim();
-    if (!key) return bilingual('请粘贴或选择未加密的 OpenSSH 私钥。', 'Paste or choose an unencrypted OpenSSH private key.');
-    if (new TextEncoder().encode(key).length > MAX_KEY_BYTES) return bilingual('私钥大于 64 KiB。', 'The private key is larger than 64 KiB.');
-    if (!key.includes('BEGIN OPENSSH PRIVATE KEY')) return bilingual('仅支持未加密的 OpenSSH 私钥。', 'Only unencrypted OpenSSH private keys are supported.');
-  }
+  const credentialError = validateCredentialSelection(
+    selectedSavedProfile() ? 'saved' : 'manual',
+    authMethod(),
+    ui.privateKey.value,
+    MAX_KEY_BYTES,
+  );
+  if (credentialError === 'required') return bilingual('请粘贴或选择未加密的 OpenSSH 私钥。', 'Paste or choose an unencrypted OpenSSH private key.');
+  if (credentialError === 'too_large') return bilingual('私钥大于 64 KiB。', 'The private key is larger than 64 KiB.');
+  if (credentialError === 'unsupported_format') return bilingual('仅支持未加密的 OpenSSH 私钥。', 'Only unencrypted OpenSSH private keys are supported.');
   return null;
 }
 
@@ -877,10 +884,9 @@ function validateConnectForm(): string | null {
   return validateConnection();
 }
 
-async function applyProfile(profile: SavedProfile): Promise<void> {
-  const loadGeneration = ++historyPasswordLoadGeneration;
-  const context = passwordContext(profile);
+function applyProfile(profile: SavedProfile): void {
   clearCredentials();
+  selectedSavedHostId = profile.id;
   ui.profileId.value = profile.id;
   ui.host.value = profile.host;
   ui.port.value = String(profile.port);
@@ -890,38 +896,15 @@ async function applyProfile(profile: SavedProfile): Promise<void> {
   ui.encoding.value = profile.encoding;
   ui.fingerprint.value = profile.fingerprint || hostKeys[targetKey(profile.host, profile.port, profile.username)] || '';
   setAuthMethod(profile.authMethod);
-  passwordDirty = false;
-  historyPasswordLoading = true;
+  ui.savedCredentialNote.hidden = false;
   setState(connectionState);
   renderProfiles();
-  let credentials: Credentials;
-  try {
-    credentials = await hostCredentials(profile.id);
-  } catch (error) {
-    if (loadGeneration === historyPasswordLoadGeneration) {
-      historyPasswordLoading = false;
-      setState(connectionState);
-    }
-    throw error;
-  }
-  if (loadGeneration !== historyPasswordLoadGeneration) return;
-  historyPasswordLoading = false;
-  const selectionUnchanged = ui.profileId.value === profile.id
-    && targetKey() === context
-    && authMethod() === profile.authMethod
-    && !passwordDirty;
-  if (selectionUnchanged) {
-    ui.password.value = credentials.password ?? '';
-    ui.privateKey.value = credentials.privateKey ?? '';
-  }
-  setState(connectionState);
 }
 
 function clearForm(): void {
-  historyPasswordLoadGeneration++;
-  historyPasswordLoading = false;
   ui.form.reset();
   clearCredentials();
+  selectedSavedHostId = null;
   ui.profileId.value = '';
   ui.port.value = '22';
   ui.username.value = 'root';
@@ -959,11 +942,6 @@ async function saveConnectedProfile(): Promise<void> {
     fingerprint: rememberedFingerprint,
     updatedAt: connectedAt,
   };
-  if (historyPasswordLoading && targetKey() === operation.target) {
-    historyPasswordLoadGeneration++;
-    historyPasswordLoading = false;
-    setState(connectionState);
-  }
   const result = await persistHistoryMutation({ kind: 'upsert', profile: saved });
   if (!result.persisted) {
     renderProfiles();
@@ -974,6 +952,14 @@ async function saveConnectedProfile(): Promise<void> {
   renderProfiles();
   if (!result.applied) return;
   toast(bilingual('主机已加密保存至云端。', 'Host encrypted and saved to the cloud.'));
+}
+
+async function markSavedProfileConnected(id: string): Promise<void> {
+  const result = await markHostConnected(id);
+  profiles = profiles
+    .map((profile) => profile.id === id ? { ...profile, updatedAt: result.updatedAt } : profile)
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+  renderProfiles();
 }
 
 async function deleteProfile(id: string): Promise<void> {
@@ -1104,7 +1090,7 @@ function setState(state: ConnectionState, label?: string): void {
   ui.liveOrb.className = `live-orb ${state}`;
   ui.liveOrbLabel.textContent = stateLabel;
   ui.liveOrb.title = stateLabel;
-  const control = resolveConnectionControl(state, historyPasswordLoading);
+  const control = resolveConnectionControl(state, false);
   const controlLabel = control.action === 'cancel'
     ? bilingual('取消连接', 'Cancel connection')
     : control.action === 'disconnect'
@@ -1160,9 +1146,6 @@ function fitTerminal(send = true): void {
 function setPanelOpen(open: boolean): void {
   const view = resolveConnectionPanel(open);
   panelOpen = view.expanded;
-  if (!view.expanded && (connectionState === 'connecting' || connectionState === 'connected' || connectionState === 'disconnecting')) {
-    invalidateHistoryPasswordLoad();
-  }
   if (!view.expanded && ui.panel.contains(document.activeElement)) ui.panelToggle.focus();
   ui.panel.classList.toggle('open', view.drawerOpen);
   ui.panel.inert = !view.expanded;
@@ -1212,12 +1195,15 @@ function stopTimers(): void {
 
 function markReady(message = bilingual('交互式 Shell 已就绪', 'Interactive shell ready')): void {
   if (connectionState === 'connected') return;
-  invalidateHistoryPasswordLoad();
   setState('connected');
   setPanelOpen(false);
-  profileSaveTask = saveConnectedProfile().catch(() => {
+  const saveReadyState = reconnectParams?.mode === 'saved'
+    ? markSavedProfileConnected(reconnectParams.hostId)
+    : saveConnectedProfile();
+  profileSaveTask = saveReadyState.catch(() => {
     toast(bilingual('连接成功，但无法更新历史记录。', 'Connected, but the history could not be updated.'), 'error');
   });
+  if (reconnectParams?.mode === 'manual') clearCredentials();
   startTimers();
   updateConnectionStatus(messageTranslation(message));
   event(message, 'ready');
@@ -1491,17 +1477,16 @@ function failActiveConnection(activeSocket: WebSocket | null, closeReason: strin
   processManager.reset();
   resetNetworkMetric();
   clearHostKeyPrompt();
-  invalidateHistoryPasswordLoad();
   updateConnectionStatus(displayReason);
   setState('error');
   if (activeSocket && activeSocket.readyState < WebSocket.CLOSING) activeSocket.close(CLIENT_CLOSE_SESSION_ERROR, closeReason);
 }
 
-async function issueTicket(signal: AbortSignal): Promise<{ ticket: string; sessionId: string }> {
+async function issueTicket(params: ReconnectParams, signal: AbortSignal): Promise<{ ticket: string; sessionId: string }> {
   const response = await fetch('/api/session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({}),
+    body: JSON.stringify(sessionRequestBody(params)),
     signal,
   });
   let payload: { ticket?: string; sessionId?: string; error?: string } = {};
@@ -1523,7 +1508,7 @@ function createSshReconnectFactory(): (attempt: number) => Promise<WebSocket> {
   return async (attempt: number): Promise<WebSocket> => {
     const params = reconnectParams!;
     const abortController = new AbortController();
-    const { ticket, sessionId } = await issueTicket(abortController.signal);
+    const { ticket, sessionId } = await issueTicket(params, abortController.signal);
     currentSessionId = sessionId;
 
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1545,21 +1530,7 @@ function createSshReconnectFactory(): (attempt: number) => Promise<WebSocket> {
       resetTerminalForConnection(terminal);
       fitTerminal(true);
 
-      const config: ConnectionConfig = {
-        type: 'connect',
-        host: params.host,
-        port: params.port,
-        username: params.username,
-        authMethod: params.authMethod as AuthMethod,
-        cols: terminal.cols,
-        rows: terminal.rows,
-        term: params.term,
-      };
-      if (params.authMethod === 'password') config.password = params.password;
-      else config.privateKey = params.privateKey;
-      if (params.pinnedKey) config.expectedFingerprint = params.pinnedKey;
-
-      ws.send(JSON.stringify(config));
+      ws.send(JSON.stringify(buildInitialConnectFrame(params, terminal.cols, terminal.rows)));
       updateConnectionStatus(localized('正在打开 TCP 连接...', 'Opening TCP connection...'));
       event(bilingual('WebSocket 已建立，正在打开 SSH 传输（自动重连）。', 'WebSocket established; opening SSH transport (auto-reconnect).'), 'transport');
     }, { once: true });
@@ -1593,6 +1564,7 @@ function handleSshReconnectLog(entry: ReconnectLogEntry): void {
     fileManager.reset();
     fileTree?.setReady(false);
     processManager.reset();
+    releaseReconnectParams();
   } else if (entry.event === 'reconnect_attempt') {
     updateConnectionStatus(localized(
       `正在重连 SSH（${entry.attempt}/${entry.maxAttempts}）…`,
@@ -1606,9 +1578,7 @@ function handleSshReconnectLog(entry: ReconnectLogEntry): void {
 async function connect(): Promise<void> {
   if (connectionState === 'connecting' || connectionState === 'connected' || connectionState === 'disconnecting') return;
   if (socket || authorizationAbort) return;
-  if (historyPasswordLoading) return;
-  historyPasswordLoadGeneration++;
-  historyPasswordLoading = false;
+
   // Fresh baseline for a new session: the previous run may have left network
   // state (interface list, baselines) if the user navigated away uncleanly.
   resetNetworkMetric();
@@ -1654,16 +1624,43 @@ async function connect(): Promise<void> {
   event(bilingual(`正在连接 ${currentTargetLabel}`, `Starting ${currentTargetLabel}`), 'connect');
 
   try {
+    const savedProfile = selectedSavedProfile();
     const password = ui.password.value;
     const privateKey = ui.privateKey.value.trim();
     const method = authMethod();
     const term = ui.termType.value;
-    const historyProfile = readProfileFromForm(password);
-    // Resolve encryption during the SSH handshake so ready can usually save synchronously.
-    void historyProfile.catch(() => undefined);
-    pendingHistory = { generation, target: currentTargetKey, profile: historyProfile };
-    const ticketRequest = issueTicket(abortController.signal);
-    const { ticket, sessionId } = await ticketRequest;
+
+    if (savedProfile) {
+      reconnectParams = {
+        mode: 'saved',
+        hostId: savedProfile.id,
+        encoding: ui.encoding.value,
+        initialCommand: currentInitialCommand,
+        label: currentTargetLabel,
+        pinnedKey: pinnedKey || undefined,
+      };
+      pendingHistory = null;
+    } else {
+      const historyProfile = readProfileFromForm(password);
+      void historyProfile.catch(() => undefined);
+      pendingHistory = { generation, target: currentTargetKey, profile: historyProfile };
+      reconnectParams = {
+        mode: 'manual',
+        host,
+        port,
+        username,
+        authMethod: method,
+        term,
+        encoding: ui.encoding.value,
+        initialCommand: currentInitialCommand,
+        label: currentTargetLabel,
+        pinnedKey: pinnedKey || undefined,
+        ...(method === 'password' ? { password } : { privateKey }),
+      };
+    }
+
+    const activeParams = reconnectParams;
+    const { ticket, sessionId } = await issueTicket(activeParams, abortController.signal);
     currentSessionId = sessionId;
     if (authorizationAbort === abortController) authorizationAbort = null;
     if (generation !== connectGeneration) return;
@@ -1676,12 +1673,6 @@ async function connect(): Promise<void> {
     const activeSocket = new WebSocket(url);
     socket = activeSocket;
     activeSocket.binaryType = 'arraybuffer';
-
-    // Persist connection parameters so the reconnect factory can reuse them.
-    reconnectParams = { host, port, username, authMethod: method, term, encoding: ui.encoding.value };
-    if (method === 'password') reconnectParams.password = password;
-    else reconnectParams.privateKey = privateKey;
-    if (pinnedKey) reconnectParams.pinnedKey = pinnedKey;
 
     // Set up (or replace) the SSH reconnect manager.
     sshReconnectManager?.reset();
@@ -1698,20 +1689,7 @@ async function connect(): Promise<void> {
         return;
       }
       fitTerminal(false);
-      const config: ConnectionConfig = {
-        type: 'connect',
-        host,
-        port,
-        username,
-        authMethod: method,
-        cols: terminal.cols,
-        rows: terminal.rows,
-        term,
-      };
-      if (method === 'password') config.password = password;
-      else config.privateKey = privateKey;
-      if (pinnedKey) config.expectedFingerprint = pinnedKey;
-      activeSocket.send(JSON.stringify(config));
+      activeSocket.send(JSON.stringify(buildInitialConnectFrame(activeParams, terminal.cols, terminal.rows)));
       updateConnectionStatus(localized('正在打开 TCP 连接...', 'Opening TCP connection...'));
       event(bilingual('WebSocket 已建立，正在打开 SSH 传输。', 'WebSocket established; opening SSH transport.'), 'transport');
     }, { once: true });
@@ -1743,7 +1721,6 @@ async function connect(): Promise<void> {
         stopTimers();
         resetNetworkMetric();
         clearHostKeyPrompt();
-        invalidateHistoryPasswordLoad();
         const reason = bilingual('SSH 连接断开，正在重连…', 'SSH connection lost; reconnecting…');
         event(reason, 'disconnect', true);
         updateConnectionStatus(messageTranslation(reason));
@@ -1753,13 +1730,15 @@ async function connect(): Promise<void> {
       }
 
       // Normal close or reconnect not available — full cleanup.
+      sshReconnectManager?.reset();
+      sshReconnectManager = null;
+      releaseReconnectParams();
       stopTimers();
       fileManager.reset();
       fileTree?.setReady(false);
       processManager.reset();
       resetNetworkMetric();
       clearHostKeyPrompt();
-      invalidateHistoryPasswordLoad();
       const reason = closeEvent.reason
         ? bilingualServerMessage(closeEvent.reason)
         : closeEvent.code === 1000
@@ -1774,7 +1753,7 @@ async function connect(): Promise<void> {
     if (authorizationAbort === abortController) authorizationAbort = null;
     if (generation !== connectGeneration) return;
     pendingHistory = null;
-    invalidateHistoryPasswordLoad();
+    releaseReconnectParams();
     clearHostKeyPrompt();
     const message = error instanceof DOMException && error.name === 'AbortError'
       ? bilingual('连接授权已取消。', 'Connection authorization was cancelled.')
@@ -1800,14 +1779,13 @@ function disconnect(reason = bilingual('已由用户断开连接', 'Disconnected
   socket = null;
   sshReconnectManager?.reset();
   sshReconnectManager = null;
-  reconnectParams = null;
+  releaseReconnectParams();
   stopTimers();
   fileManager.reset();
   fileTree?.setReady(false);
   processManager.reset();
   resetNetworkMetric();
   clearHostKeyPrompt();
-  invalidateHistoryPasswordLoad();
   currentExpectedFingerprint = '';
   currentRememberedFingerprint = '';
   updateConnectionStatus(messageTranslation(reason));
@@ -1895,8 +1873,7 @@ function applyURLParameters(): boolean {
 }
 
 function applyWSSHOptions(options: WSSHOptions): void {
-  historyPasswordLoadGeneration++;
-  historyPasswordLoading = false;
+  selectedSavedHostId = null;
   clearCredentials();
   ui.host.value = options.host ?? options.hostname ?? ui.host.value;
   setPortValue(options.port ?? 22, 'wssh.connect()');
@@ -1904,7 +1881,7 @@ function applyWSSHOptions(options: WSSHOptions): void {
   if (options.password !== undefined) {
     setAuthMethod('password');
     ui.password.value = options.password;
-    passwordDirty = true;
+    credentialInputDirty = true;
   }
   const key = options.privateKey ?? options.privatekey;
   if (key !== undefined) {
@@ -1952,7 +1929,7 @@ function initializeCompatibilityAPI(): void {
 
 for (const radio of ui.form.querySelectorAll<HTMLInputElement>('input[name="authMethod"]')) {
   radio.addEventListener('change', () => {
-    cancelHistoryPasswordLoad();
+    cancelSavedSelection();
     setAuthMethod(authMethod());
   });
 }
@@ -1968,11 +1945,12 @@ ui.form.addEventListener('submit', (formEvent) => {
 });
 ui.shareLink.addEventListener('click', copySafeLink);
 ui.password.addEventListener('input', () => {
-  cancelHistoryPasswordLoad();
-  passwordDirty = true;
+  cancelSavedSelection();
 });
-for (const field of [ui.host, ui.port, ui.username]) {
-  field.addEventListener('input', cancelHistoryPasswordLoad);
+ui.privateKey.addEventListener('input', cancelSavedSelection);
+for (const field of [ui.host, ui.port, ui.username, ui.termType, ui.fingerprint]) {
+  field.addEventListener('input', cancelSavedSelection);
+  field.addEventListener('change', cancelSavedSelection);
 }
 ui.revealPassword.addEventListener('click', () => {
   const reveal = ui.password.type === 'password';
@@ -1986,6 +1964,7 @@ ui.keyFile.addEventListener('change', async () => {
     clearPrivateKeyFields();
     return;
   }
+  cancelSavedSelection();
   ui.keyFileName.textContent = file.name;
   if (file.size > MAX_KEY_BYTES) {
     showFormError(bilingual('所选私钥大于 64 KiB。', 'The selected private key is larger than 64 KiB.'));
@@ -2016,7 +1995,7 @@ ui.profileList.addEventListener('click', (clickEvent) => {
   }
   const card = target.closest<HTMLElement>('[data-profile-id]');
   const profile = profiles.find((item) => item.id === card?.dataset.profileId);
-  if (profile) void applyProfile(profile).catch((error) => toast(error instanceof Error ? error.message : '读取凭据失败。', 'error'));
+  if (profile) applyProfile(profile);
 });
 ui.panelToggle.addEventListener('click', () => {
   const opening = !panelOpen;
@@ -2260,6 +2239,8 @@ async function initialize(): Promise<void> {
     leaveWorkspace: () => {
       disconnect(bilingual('已返回主机总览', 'Returned to host dashboard'));
       clearCredentials();
+      selectedSavedHostId = null;
+      ui.profileId.value = '';
     },
   });
   await dashboard.start();
