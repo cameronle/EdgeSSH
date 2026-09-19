@@ -1,6 +1,14 @@
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+import {
+  cycleThemePreference,
+  getThemePreference,
+  initializeTheme,
+  onThemeChange,
+  themePreferenceLabel,
+  type ThemePreference,
+} from './theme';
 import { historyKey, historyLabel } from './history';
 import { listHosts, hostCredentials, saveHost, removeHost, updateHostSystem, type CloudHost, type Credentials, type HostSystemInfo } from './cloud-api';
 import { Dashboard } from './dashboard';
@@ -101,7 +109,6 @@ declare global {
   }
 }
 
-const THEME_STORAGE_KEY = 'workers-webssh.theme';
 const LANGUAGE_STORAGE_KEY = 'workers-webssh.language';
 const MAX_KEY_BYTES = 65_536;
 const PING_INTERVAL_MS = 25_000;
@@ -2041,15 +2048,17 @@ ui.processManagerTab.addEventListener('keydown', handleWorkspaceTabKey);
 ui.eventToggle.addEventListener('keydown', handleWorkspaceTabKey);
 ui.languageToggle.addEventListener('click', () => {
   applyLanguage(currentLanguage === 'zh-CN' ? 'en' : 'zh-CN', true);
+  updateThemeControls();
   renderProfiles();
   setState(connectionState);
   setPanelOpen(panelOpen);
   if (connectionState === 'idle' && !currentTargetLabel) ui.sessionTitle.textContent = bilingual('无活动会话', 'No active session');
 });
-ui.themeToggle.addEventListener('click', () => {
-  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-  document.documentElement.dataset.theme = next;
-  try { localStorage.setItem(THEME_STORAGE_KEY, next); } catch { /* Theme still applies for this page. */ }
+document.addEventListener('click', (event) => {
+  const target = event.target as HTMLElement | null;
+  const toggle = target?.closest<HTMLElement>('[data-theme-toggle]');
+  if (!toggle || toggle === ui.themeToggle) return;
+  cycleThemePreference();
 });
 ui.hostKeyDialog.addEventListener('cancel', (cancelEvent) => {
   cancelEvent.preventDefault();
@@ -2201,11 +2210,27 @@ document.addEventListener('keydown', (keyEvent) => {
   }
 });
 
-let storedTheme: string | null = null;
-try { storedTheme = localStorage.getItem(THEME_STORAGE_KEY); } catch { /* Storage can be disabled. */ }
-if (storedTheme === 'light' || storedTheme === 'dark') document.documentElement.dataset.theme = storedTheme;
+function updateThemeControls(preference: ThemePreference = getThemePreference()): void {
+  const language = currentLanguage;
+  const label = themePreferenceLabel(preference, language);
+  const nextLabel = language === 'en'
+    ? 'Cycle theme: system, light, dark'
+    : '切换主题：跟随系统、浅色、深色';
+  document.querySelectorAll<HTMLElement>('[data-theme-toggle]').forEach((control) => {
+    control.setAttribute('aria-label', label);
+    control.setAttribute('title', `${label} · ${nextLabel}`);
+    control.dataset.themePreference = preference;
+    const labelNode = control.querySelector<HTMLElement>('[data-theme-label]');
+    if (labelNode) labelNode.textContent = label;
+  });
+}
+
+initializeTheme();
+onThemeChange((preference) => updateThemeControls(preference));
+
 async function initialize(): Promise<void> {
   applyLanguage(currentLanguage);
+  updateThemeControls();
   renderProfiles();
   setPanelOpen(panelOpen);
   setAuthMethod('password');
@@ -2238,6 +2263,7 @@ async function initialize(): Promise<void> {
     },
   });
   await dashboard.start();
+  updateThemeControls();
 }
 
 void initialize().catch((error) => {

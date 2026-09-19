@@ -1,3 +1,5 @@
+import { initializeTheme } from './theme';
+
 const LANGUAGE_STORAGE_KEY = 'workers-webssh.language';
 
 let language: 'zh-CN' | 'en' | null = null;
@@ -11,3 +13,4 @@ try {
 if (!language) language = navigator.language.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en';
 document.documentElement.lang = language;
 document.documentElement.dataset.language = language;
+initializeTheme();

@@ -41,6 +41,9 @@ export class Dashboard {
         <a class="home-brand" href="/" aria-label="EdgeSSH 首页"><span class="brand-chevron">›_</span>Edge<span>SSH</span></a>
         <label class="home-search">${icon('search')}<input id="host-search" type="search" placeholder="搜索主机、分组或 IP 地址" aria-label="搜索主机"><kbd>Ctrl K</kbd></label>
         <button class="home-button primary header-add" data-add>＋ 新建主机</button>
+        <button class="home-button theme-toggle-button" type="button" data-theme-toggle aria-label="跟随系统" title="跟随系统">
+          <span class="theme-toggle-icon" aria-hidden="true">◐</span><span data-theme-label>跟随系统</span>
+        </button>
         <div class="home-account"><span class="account-avatar">A</span><span id="account-label">验证身份中</span><a href="/cdn-cgi/access/logout" title="退出 Access">退出</a></div>
       </header>
       <div class="home-layout">
