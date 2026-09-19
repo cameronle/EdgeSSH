@@ -3,24 +3,7 @@ import { decryptHost, encryptHost } from './crypto';
 import { APIError, json, readJSON } from './http';
 import { locateHost, type HostLocation } from './location';
 import type { SystemInfo } from '../backend/system-info';
-
-export interface HostPayload {
-  name: string;
-  group: string;
-  host: string;
-  port: number;
-  username: string;
-  authMethod: 'password' | 'publickey';
-  password?: string;
-  privateKey?: string;
-  initialCommand: string;
-  termType: string;
-  encoding: string;
-  fingerprint: string;
-  location: HostLocation | null;
-  locationCheckedAt?: number;
-  system?: SystemInfo | null;
-}
+import type { HostPayload } from './saved-connection.ts';
 interface HostRow { id: string; encrypted_payload: string; updated_at: number }
 
 const LOCATION_RETRY_MS = 24 * 60 * 60 * 1000;
