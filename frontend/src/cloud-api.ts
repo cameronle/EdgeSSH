@@ -30,8 +30,8 @@ export interface CloudHost {
   updatedAt: number;
 }
 
-export interface Credentials { password?: string; privateKey?: string }
-export type HostInput = Omit<CloudHost, 'id' | 'location' | 'system' | 'hasCredential' | 'updatedAt'> & Credentials;
+export interface HostCredentialInput { password?: string; privateKey?: string }
+export type HostInput = Omit<CloudHost, 'id' | 'location' | 'system' | 'hasCredential' | 'updatedAt'> & HostCredentialInput;
 
 export class APIError extends Error {
   constructor(message: string, readonly status: number) { super(message); }
@@ -55,7 +55,8 @@ export async function api<T>(path: string, method = 'GET', body?: unknown): Prom
 }
 
 export const listHosts = async (): Promise<CloudHost[]> => (await api<{ hosts: CloudHost[] }>('/api/hosts')).hosts;
-export const hostCredentials = (id: string): Promise<Credentials> => api(`/api/hosts/${id}/credentials`, 'POST');
+export const markHostConnected = (id: string): Promise<{ ok: true; updatedAt: number }> =>
+  api(`/api/hosts/${id}/connected`, 'POST');
 export const refreshHostLocation = async (id: string): Promise<CloudHost> =>
   (await api<{ host: CloudHost }>(`/api/hosts/${id}/location`, 'POST')).host;
 export const updateHostSystem = async (id: string, system: HostSystemInfo): Promise<CloudHost> =>

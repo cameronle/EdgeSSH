@@ -718,6 +718,29 @@ button:disabled {
   outline: 2px solid var(--accent);
 }
 
+.saved-credential-note {
+  display: flex;
+  gap: 7px;
+  align-items: flex-start;
+  margin: 0;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.saved-credential-note[hidden] {
+  display: none;
+}
+
+.saved-credential-note > span:first-child {
+  color: var(--accent);
+  font-weight: 800;
+}
+
 .input-action-wrap {
   position: relative;
   display: block;

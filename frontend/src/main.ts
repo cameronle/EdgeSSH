@@ -10,7 +10,7 @@ import {
   type ThemePreference,
 } from './theme';
 import { historyKey, historyLabel } from './history';
-import { listHosts, saveHost, removeHost, updateHostSystem, type CloudHost, type HostSystemInfo } from './cloud-api';
+import { listHosts, markHostConnected, saveHost, removeHost, updateHostSystem, type CloudHost, type HostSystemInfo } from './cloud-api';
 import {
   buildInitialConnectFrame,
   sessionRequestBody,
@@ -254,6 +254,7 @@ const ui = {
   username: element<HTMLInputElement>('username'),
   password: element<HTMLInputElement>('password'),
   passwordField: element<HTMLElement>('password-field'),
+  savedCredentialNote: element<HTMLElement>('saved-credential-note'),
   revealPassword: element<HTMLButtonElement>('reveal-password'),
   keyField: element<HTMLElement>('key-field'),
   privateKey: element<HTMLTextAreaElement>('private-key'),
@@ -765,6 +766,12 @@ function clearCredentials(): void {
   resetPasswordField();
   clearPrivateKeyFields();
   credentialInputDirty = false;
+  ui.savedCredentialNote.hidden = true;
+}
+
+function releaseReconnectParams(): void {
+  if (reconnectParams?.mode === 'manual') clearCredentials();
+  reconnectParams = null;
 }
 
 function normalizeHost(host: string): string {
@@ -806,6 +813,7 @@ function cancelSavedSelection(): void {
   selectedSavedHostId = null;
   ui.profileId.value = '';
   credentialInputDirty = true;
+  ui.savedCredentialNote.hidden = true;
   renderProfiles();
 }
 
@@ -888,6 +896,7 @@ function applyProfile(profile: SavedProfile): void {
   ui.encoding.value = profile.encoding;
   ui.fingerprint.value = profile.fingerprint || hostKeys[targetKey(profile.host, profile.port, profile.username)] || '';
   setAuthMethod(profile.authMethod);
+  ui.savedCredentialNote.hidden = false;
   setState(connectionState);
   renderProfiles();
 }
@@ -943,6 +952,14 @@ async function saveConnectedProfile(): Promise<void> {
   renderProfiles();
   if (!result.applied) return;
   toast(bilingual('主机已加密保存至云端。', 'Host encrypted and saved to the cloud.'));
+}
+
+async function markSavedProfileConnected(id: string): Promise<void> {
+  const result = await markHostConnected(id);
+  profiles = profiles
+    .map((profile) => profile.id === id ? { ...profile, updatedAt: result.updatedAt } : profile)
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+  renderProfiles();
 }
 
 async function deleteProfile(id: string): Promise<void> {
@@ -1180,9 +1197,13 @@ function markReady(message = bilingual('交互式 Shell 已就绪', 'Interactive
   if (connectionState === 'connected') return;
   setState('connected');
   setPanelOpen(false);
-  profileSaveTask = saveConnectedProfile().catch(() => {
+  const saveReadyState = reconnectParams?.mode === 'saved'
+    ? markSavedProfileConnected(reconnectParams.hostId)
+    : saveConnectedProfile();
+  profileSaveTask = saveReadyState.catch(() => {
     toast(bilingual('连接成功，但无法更新历史记录。', 'Connected, but the history could not be updated.'), 'error');
   });
+  if (reconnectParams?.mode === 'manual') clearCredentials();
   startTimers();
   updateConnectionStatus(messageTranslation(message));
   event(message, 'ready');
@@ -1543,6 +1564,7 @@ function handleSshReconnectLog(entry: ReconnectLogEntry): void {
     fileManager.reset();
     fileTree?.setReady(false);
     processManager.reset();
+    releaseReconnectParams();
   } else if (entry.event === 'reconnect_attempt') {
     updateConnectionStatus(localized(
       `正在重连 SSH（${entry.attempt}/${entry.maxAttempts}）…`,
@@ -1708,6 +1730,9 @@ async function connect(): Promise<void> {
       }
 
       // Normal close or reconnect not available — full cleanup.
+      sshReconnectManager?.reset();
+      sshReconnectManager = null;
+      releaseReconnectParams();
       stopTimers();
       fileManager.reset();
       fileTree?.setReady(false);
@@ -1728,6 +1753,7 @@ async function connect(): Promise<void> {
     if (authorizationAbort === abortController) authorizationAbort = null;
     if (generation !== connectGeneration) return;
     pendingHistory = null;
+    releaseReconnectParams();
     clearHostKeyPrompt();
     const message = error instanceof DOMException && error.name === 'AbortError'
       ? bilingual('连接授权已取消。', 'Connection authorization was cancelled.')
@@ -1753,7 +1779,7 @@ function disconnect(reason = bilingual('已由用户断开连接', 'Disconnected
   socket = null;
   sshReconnectManager?.reset();
   sshReconnectManager = null;
-  reconnectParams = null;
+  releaseReconnectParams();
   stopTimers();
   fileManager.reset();
   fileTree?.setReady(false);

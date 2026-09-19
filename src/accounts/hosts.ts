@@ -1,7 +1,7 @@
-import { parseConnectMessage, type Env } from '../types';
-import { decryptHost, encryptHost } from './crypto';
-import { APIError, json, readJSON } from './http';
-import { locateHost, type HostLocation } from './location';
+import { parseConnectMessage, type Env } from '../types.ts';
+import { decryptHost, encryptHost } from './crypto.ts';
+import { APIError, json, readJSON } from './http.ts';
+import { locateHost, type HostLocation } from './location.ts';
 import type { SystemInfo } from '../backend/system-info';
 import type { HostPayload } from './saved-connection.ts';
 interface HostRow { id: string; encrypted_payload: string; updated_at: number }
@@ -65,9 +65,20 @@ function validate(body: Record<string, unknown>, previous?: HostPayload): HostPa
 }
 
 export async function hostsRoute(request: Request, env: Env, accountId: string, pathname: string): Promise<Response> {
-  const match = /^\/api\/hosts(?:\/([a-f0-9-]{36})(?:\/(credentials|location|system))?)?$/.exec(pathname);
+  const match = /^\/api\/hosts(?:\/([a-f0-9-]{36})(?:\/(credentials|connected|location|system))?)?$/.exec(pathname);
   if (!match) throw new APIError('接口不存在。', 404);
   const [, id, action] = match;
+  if (action === 'credentials') {
+    throw new APIError('此版本不再向浏览器返回保存的凭据，请刷新页面后重试。', 410);
+  }
+  if (action === 'connected') {
+    if (request.method !== 'POST') throw new APIError('不支持此请求方法。', 405);
+    const now = Date.now();
+    const result = await env.DB.prepare('UPDATE hosts SET updated_at = ? WHERE id = ? AND account_id = ?')
+      .bind(now, id, accountId).run();
+    if (!result.meta.changes) throw new APIError('主机不存在。', 404);
+    return json({ ok: true, updatedAt: now });
+  }
   if (!id && request.method === 'GET') {
     const rows = await env.DB.prepare('SELECT id, encrypted_payload, updated_at FROM hosts WHERE account_id = ? ORDER BY updated_at DESC')
       .bind(accountId).all<HostRow>();
@@ -100,9 +111,7 @@ export async function hostsRoute(request: Request, env: Env, accountId: string, 
       return json({ ok: true });
     }
     previous = await decryptHost<HostPayload>(previousRow.encrypted_payload, env.ENCRYPTION_KEY, accountId, id);
-    if (action === 'credentials' && request.method === 'POST') {
-      return json({ password: previous.password, privateKey: previous.privateKey });
-    }
+
     if (action === 'location' && request.method === 'POST') {
       await refreshLocation(previous);
       const encrypted = await encryptHost(previous, env.ENCRYPTION_KEY, accountId, id);

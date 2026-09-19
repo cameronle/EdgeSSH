@@ -138,6 +138,11 @@
                 <label><input type="radio" name="authMethod" value="publickey" /><span data-i18n-zh="SSH 密钥" data-i18n-en="SSH key">SSH 密钥</span></label>
               </div>
 
+              <p id="saved-credential-note" class="saved-credential-note" hidden>
+                <span aria-hidden="true">✓</span>
+                <span data-i18n-zh="将使用 Worker 中加密保存的凭据；浏览器不会读取密码或私钥。" data-i18n-en="Uses the credential encrypted in the Worker; the browser will not read the password or private key.">将使用 Worker 中加密保存的凭据；浏览器不会读取密码或私钥。</span>
+              </p>
+
               <div id="password-field" class="field secret-field">
                 <label for="password">
                   <span data-i18n-zh="密码" data-i18n-en="Password">密码</span>
