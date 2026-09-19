@@ -1,12 +1,12 @@
-# Production Worker configuration. Staging uses wrangler.staging.toml.
-name = "edgessh"
+# Staging Worker configuration. Uses isolated D1 and Durable Object state.
+name = "edgessh-staging"
 main = "src/worker.ts"
 compatibility_date = "2026-07-01"
 workers_dev = false
 preview_urls = false
 
 routes = [
-  { pattern = "ssh.865455.xyz", custom_domain = true }
+  { pattern = "ssh-staging.865455.xyz", custom_domain = true }
 ]
 
 [build]
@@ -31,6 +31,6 @@ new_sqlite_classes = ["SSHSessionDO"]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "edgessh-accounts"
-database_id = "f7059f46-a0df-4924-bb8d-de6cf213f6c4"
+database_name = "edgessh-staging-accounts"
+database_id = "d7ecdc6a-d5de-4cd6-aeeb-6358b8c80b6d"
 migrations_dir = "migrations"

@@ -68,6 +68,43 @@ function normalizeIPv6(host: string): string {
   }
 }
 
+function parseIPv6Groups(value: string): number[] | null {
+  const normalized = value.toLowerCase();
+  if (!/^[0-9a-f:.]+$/.test(normalized) || normalized.includes(':::')) return null;
+  const expand = (part: string): number[] | null => {
+    if (!part) return [];
+    const result: number[] = [];
+    for (const token of part.split(':')) {
+      if (!token) return null;
+      if (token.includes('.')) {
+        if (!isIPv4(token)) return null;
+        const [a, b, c, d] = token.split('.').map(Number);
+        result.push((a << 8) | b, (c << 8) | d);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/.test(token)) return null;
+        result.push(Number.parseInt(token, 16));
+      }
+    }
+    return result;
+  };
+  const marker = normalized.indexOf('::');
+  if (marker >= 0 && normalized.indexOf('::', marker + 1) >= 0) return null;
+  if (marker < 0) {
+    const groups = expand(normalized);
+    return groups?.length === 8 ? groups : null;
+  }
+  const left = expand(normalized.slice(0, marker));
+  const right = expand(normalized.slice(marker + 2));
+  if (!left || !right || left.length + right.length >= 8) return null;
+  return [...left, ...new Array(8 - left.length - right.length).fill(0), ...right];
+}
+
+function embeddedIPv4(groups: number[], offset: number): string | null {
+  if (groups.length !== 8 || offset < 0 || offset + 1 >= groups.length) return null;
+  const numeric = (groups[offset] * 0x10000 + groups[offset + 1]) >>> 0;
+  return `${numeric >>> 24}.${numeric >>> 16 & 0xff}.${numeric >>> 8 & 0xff}.${numeric & 0xff}`;
+}
+
 export function isPrivateAddress(host: string): boolean {
   const value = host.toLowerCase().replace(/^\[|\]$/g, '');
   if (value === 'localhost' || value.endsWith('.localhost') || value === '0.0.0.0'
@@ -89,20 +126,36 @@ export function isPrivateAddress(host: string): boolean {
   }
   if (!value.includes(':')) return false;
   const ipv6 = normalizeIPv6(value);
-  if (ipv6 === '::' || ipv6 === '::1'
-    || /^f[cd]/.test(ipv6)
-    || /^fe[89ab]/.test(ipv6)
-    || ipv6.startsWith('2001:db8:')
-    || ipv6.startsWith('ff')) return true;
-  if (ipv6.startsWith('::ffff:')) {
-    const mapped = ipv6.slice('::ffff:'.length);
-    if (isIPv4(mapped)) return isPrivateAddress(mapped);
-    const halves = mapped.split(':');
-    if (halves.length === 2 && halves.every((part) => /^[0-9a-f]{1,4}$/.test(part))) {
-      const numeric = (Number.parseInt(halves[0], 16) * 0x10000 + Number.parseInt(halves[1], 16)) >>> 0;
-      return isPrivateAddress(`${numeric >>> 24}.${numeric >>> 16 & 0xff}.${numeric >>> 8 & 0xff}.${numeric & 0xff}`);
-    }
-    return true;
+  const groups = parseIPv6Groups(ipv6);
+  if (!groups) return true;
+  if (groups[0] === 0 && groups.slice(1).every((group) => group === 0)) return true;
+  if (groups[0] === 0 && groups.slice(1, 7).every((group) => group === 0) && groups[7] === 1) return true;
+
+  // IPv4-compatible (::/96) and IPv4-mapped (::ffff:0:0/96) forms must
+  // receive the same private/reserved-address treatment as their IPv4 value.
+  const compatible = groups.slice(0, 6).every((group) => group === 0);
+  const mapped = groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff;
+  if (compatible || mapped) {
+    const address = embeddedIPv4(groups, 6);
+    if (address) return isPrivateAddress(address);
+  }
+
+  const first = groups[0], second = groups[1];
+  if ((first & 0xfe00) === 0xfc00 // Unique local (fc00::/7)
+    || (first & 0xffc0) === 0xfe80 // Link-local (fe80::/10)
+    || (first & 0xffc0) === 0xfec0 // Deprecated site-local (fec0::/10)
+    || first === 0x0100 // Discard-only (100::/64)
+    || (first === 0x2001 && second === 0) // Teredo (2001::/32)
+    || (first === 0x2001 && (second & 0xfff0) === 0x0010) // ORCHID
+    || (first === 0x2001 && second === 0x0002) // Benchmarking (2001:2::/48)
+    || (first === 0x2001 && second === 0x0db8) // Documentation
+    || (first & 0xff00) === 0xff00 // Multicast
+  ) return true;
+
+  // A 6to4 address can embed a private IPv4 target in groups 2 and 3.
+  if (first === 0x2002) {
+    const address = embeddedIPv4(groups, 2);
+    if (address && isPrivateAddress(address)) return true;
   }
   return false;
 }

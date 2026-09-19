@@ -7,11 +7,17 @@
   "scripts": {
     "dev": "wrangler dev",
     "dev:web": "vite --config vite.config.ts",
+    "build": "npm run build:web",
     "build:web": "vite build --config vite.config.ts",
     "typecheck": "tsc -p tsconfig.worker.json --noEmit && tsc -p tsconfig.frontend.json --noEmit",
     "test": "node --test --experimental-strip-types tests/*.test.ts",
-    "check": "npm run typecheck && npm run test && wrangler deploy --dry-run --outdir .wrangler/build",
-    "deploy": "wrangler deploy"
+    "check": "npm run typecheck && npm run test && wrangler deploy --dry-run --config wrangler.toml --outdir .wrangler/production-build",
+    "check:staging": "npm run typecheck && npm run test && wrangler deploy --dry-run --config wrangler.staging.toml --outdir .wrangler/staging-build",
+    "migrate:production": "wrangler d1 migrations apply DB --remote --config wrangler.toml",
+    "migrate:staging": "wrangler d1 migrations apply DB --remote --config wrangler.staging.toml",
+    "deploy:production": "npm run check && npm run migrate:production && wrangler deploy --config wrangler.toml",
+    "deploy:staging": "npm run check:staging && npm run migrate:staging && wrangler deploy --config wrangler.staging.toml",
+    "deploy": "npm run deploy:production"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
