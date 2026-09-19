@@ -1,14 +1,16 @@
 import { connect } from 'cloudflare:sockets';
-import { parseConnectMessage, type Env } from '../types';
+import { parseSessionRequest, type Env, type SessionGrant, type SSHConnectionConfig } from '../types';
 import { assertPublicTarget, toSocketHostname } from './security';
 import { createTicket, verifyTicket } from './security';
 import { SSHSession } from './session';
+import { connectionConfigForGrant } from './connection-grant';
 
 interface MainAttachment { role: 'main'; phase: 'waiting' | 'connecting' | 'connected' }
 interface SFTPAttachment { role: 'sftp'; phase: 'connected' }
 interface ProcessAttachment { role: 'process'; phase: 'connected' }
 type Attachment = MainAttachment | SFTPAttachment | ProcessAttachment;
-interface StoredTicket { secret: number[]; expiresAt: number; ip: string }
+interface StoredTicket { secret: number[]; expiresAt: number; ip: string; grant: SessionGrant }
+interface PendingGrant { accountId: string; grant: SessionGrant }
 interface PendingConnection {
   cancelled: boolean;
   socket?: Socket;
@@ -30,6 +32,7 @@ export class SSHSessionDO implements DurableObject {
   private readonly state: DurableObjectState;
   private readonly env: Env;
   private readonly sessions = new Map<WebSocket, SSHSession>();
+  private readonly pendingGrants = new Map<WebSocket, PendingGrant>();
   private readonly pendingConnections = new Map<WebSocket, PendingConnection>();
   private readonly deadlines = new Map<WebSocket, ReturnType<typeof setTimeout>>();
   private readonly sftpAttachTokens = new Map<string, SFTPAttachToken>();
@@ -65,11 +68,14 @@ export class SSHSessionDO implements DurableObject {
     if (url.pathname === '/ticket' && request.method === 'POST') {
       const ip = request.headers.get('x-client-ip') ?? 'unknown';
       if (!/^[0-9a-f:.]{2,64}$|^local$|^unknown$/i.test(ip)) return Response.json({ error: 'Invalid client address' }, { status: 400 });
+      let grant: SessionGrant;
+      try { grant = parseSessionRequest(await request.json()); }
+      catch { return Response.json({ error: 'Invalid session grant' }, { status: 400 }); }
       const secret = crypto.getRandomValues(new Uint8Array(32));
       const created = await createTicket(secret, ip);
       const stored = await this.state.storage.transaction(async (tx) => {
         if (await tx.get(TICKET_STORAGE_KEY)) return false;
-        await tx.put(TICKET_STORAGE_KEY, { secret: Array.from(secret), expiresAt: created.expiresAt, ip } satisfies StoredTicket);
+        await tx.put(TICKET_STORAGE_KEY, { secret: Array.from(secret), expiresAt: created.expiresAt, ip, grant } satisfies StoredTicket);
         await tx.put('account-id', accountId);
         await tx.setAlarm(created.expiresAt);
         return true;
@@ -97,7 +103,8 @@ export class SSHSessionDO implements DurableObject {
     }
     const ticket = request.headers.get('x-session-ticket');
     const ip = request.headers.get('x-client-ip') ?? 'unknown';
-    if (!ticket || !await this.consumeTicket(ticket, ip)) {
+    const grant = ticket ? await this.consumeTicket(ticket, ip) : null;
+    if (!grant) {
       return Response.json({ error: 'Invalid session ticket' }, { status: 401 });
     }
     const pair = new WebSocketPair();
@@ -105,6 +112,7 @@ export class SSHSessionDO implements DurableObject {
     const server = pair[1];
     this.state.acceptWebSocket(server);
     server.serializeAttachment({ role: 'main', phase: 'waiting' } satisfies MainAttachment);
+    this.pendingGrants.set(server, { accountId, grant });
     this.registerSFTPAttachToken(sftpAttachToken, sftpAttachUrl, server);
     this.registerProcessAttachToken(processAttachToken, processAttachUrl, server);
     const deadline = setTimeout(() => this.reject(server, 'Connect message timeout'), 10_000);
@@ -153,14 +161,25 @@ export class SSHSessionDO implements DurableObject {
         return;
       }
       if (this.pendingConnections.has(ws)) throw new Error('An SSH connection is already being initialized');
+      const pendingGrant = this.pendingGrants.get(ws);
+      if (!pendingGrant) throw new Error('Session authorization is unavailable');
       if (typeof message !== 'string' || message.length > 160 * 1024) throw new Error('The first WebSocket message must be a connect JSON object');
       let decoded: unknown;
       try { decoded = JSON.parse(message); } catch { throw new Error('Invalid connect JSON'); }
-      const config = parseConnectMessage(decoded);
       const pending: PendingConnection = { cancelled: false, closedSockets: new WeakSet() };
       this.pendingConnections.set(ws, pending);
+      this.pendingGrants.delete(ws);
       ws.serializeAttachment({ role: 'main', phase: 'connecting' } satisfies MainAttachment);
       this.clearDeadline(ws);
+      const config = await connectionConfigForGrant(this.env, pendingGrant.accountId, pendingGrant.grant, decoded);
+      await this.startConnection(ws, config, pending);
+    } catch (error) {
+      this.reject(ws, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async startConnection(ws: WebSocket, config: SSHConnectionConfig, pending: PendingConnection): Promise<void> {
+    try {
       if (config.port === 25) throw new Error('Cloudflare Workers cannot connect to outbound TCP port 25');
       const verifiedAddresses = await assertPublicTarget(config.host);
       this.assertConnectionActive(ws, pending);
@@ -194,7 +213,7 @@ export class SSHSessionDO implements DurableObject {
       ws.serializeAttachment({ role: 'main', phase: 'connected' } satisfies MainAttachment);
       await ssh.start();
     } catch (error) {
-      this.reject(ws, error instanceof Error ? error.message : String(error));
+      throw error;
     }
   }
 
@@ -220,10 +239,10 @@ export class SSHSessionDO implements DurableObject {
     return Number.isFinite(configured) ? Math.min(30_000, Math.max(2_000, Math.floor(configured))) : 10_000;
   }
 
-  private async consumeTicket(ticket: string, ip: string): Promise<boolean> {
+  private async consumeTicket(ticket: string, ip: string): Promise<SessionGrant | null> {
     return this.state.storage.transaction(async (tx) => {
       const stored = await tx.get<StoredTicket>(TICKET_STORAGE_KEY);
-      if (!stored) return false;
+      if (!stored) return null;
       // A presented ticket is one-shot even when malformed, which closes the
       // replay race without retaining authorization material after an attempt.
       await tx.delete(TICKET_STORAGE_KEY);
@@ -233,10 +252,10 @@ export class SSHSessionDO implements DurableObject {
       // 不校验 stored.ip !== ip：反代/CDN（如腾讯云 EdgeOne）多节点回源会让
       // CF-Connecting-IP 在签发与使用两次请求间不一致，导致 ticket 误判失效
       // （概率性 "WebSocket 传输错误"）。详见 verifyTicket 注释。stored.ip 保留用于审计。
-      if (stored.expiresAt < Date.now() || stored.secret.length !== 32) return false;
+      if (stored.expiresAt < Date.now() || stored.secret.length !== 32 || !stored.grant) return null;
       const secret = new Uint8Array(stored.secret);
       try {
-        return await verifyTicket(secret, ticket, ip);
+        return await verifyTicket(secret, ticket, ip) ? stored.grant : null;
       } finally {
         secret.fill(0);
       }
@@ -420,6 +439,7 @@ export class SSHSessionDO implements DurableObject {
 
   private cleanup(ws: WebSocket): void {
     this.clearDeadline(ws);
+    this.pendingGrants.delete(ws);
     const token = this.sftpTokenByMainWebSocket.get(ws);
     if (token) this.deleteSFTPAttachToken(token);
     const processToken = this.processTokenByMainWebSocket.get(ws);

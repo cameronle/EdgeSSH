@@ -1,10 +1,11 @@
-import type { Env } from './types';
+import { parseSessionRequest, type Env } from './types';
 import { SSHSessionDO } from './backend/durable-object';
 import { corsPreflightResponse, corsResponse, httpsRedirect, isProductionHttp, jsonError, secureResponse } from './http-security';
 import { currentAccount } from './accounts/auth';
 import { hostsRoute } from './accounts/hosts';
-import { apiFailure, json } from './accounts/http';
+import { apiFailure, json, readJSON } from './accounts/http';
 import { locateHost } from './accounts/location';
+import { savedHostExists } from './accounts/saved-connection';
 
 export { SSHSessionDO };
 
@@ -19,27 +20,27 @@ function hasValidWebSocketOrigin(request: Request): boolean {
 }
 
 async function sessionTicket(request: Request, env: Env, accountId: string): Promise<Response> {
-  if (!request.headers.get('Content-Type')?.toLowerCase().startsWith('application/json')) return jsonError('Expected application/json', 415);
-  const contentLength = Number(request.headers.get('Content-Length') ?? 0);
-  if (!Number.isFinite(contentLength) || contentLength < 0 || contentLength > 8192) return jsonError('Request body is too large', 413);
-  let body: unknown;
-  try {
-    const text = await request.text();
-    if (new TextEncoder().encode(text).length > 8192) return jsonError('Request body is too large', 413);
-    body = JSON.parse(text);
-  } catch { return jsonError('Invalid JSON body', 400); }
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonError('Invalid JSON body', 400);
-  const fields = Object.keys(body as Record<string, unknown>);
-  if (fields.length > 0) return jsonError('Unsupported request field', 400);
+  const body = await readJSON(request, 8192);
+  let grant;
+  try { grant = parseSessionRequest(body); }
+  catch { return jsonError('Invalid session request', 400); }
+  if (grant.mode === 'saved' && !await savedHostExists(env, accountId, grant.hostId!)) {
+    return jsonError('Saved host not found', 404);
+  }
   const id = env.SSH_SESSIONS.newUniqueId();
   const stub = env.SSH_SESSIONS.get(id);
   const response = await stub.fetch(new Request('https://session.internal/ticket', {
     method: 'POST',
-    headers: { 'x-client-ip': clientAddress(request), 'x-account-id': accountId },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-client-ip': clientAddress(request),
+      'x-account-id': accountId,
+    },
+    body: JSON.stringify(grant.mode === 'saved' ? { hostId: grant.hostId } : {}),
   }));
   if (!response.ok) return jsonError('Unable to create a session ticket', 503);
   const ticket = await response.json<{ ticket: string; expiresAt: number }>();
-  return secureResponse(Response.json({ ...ticket, sessionId: id.toString() }, { headers: { 'Cache-Control': 'no-store' } }));
+  return secureResponse(Response.json({ ...ticket, sessionId: id.toString(), mode: grant.mode }, { headers: { 'Cache-Control': 'no-store' } }));
 }
 
 async function sshUpgrade(request: Request, env: Env, accountId: string): Promise<Response> {
